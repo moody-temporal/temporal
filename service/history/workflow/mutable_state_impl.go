@@ -5895,10 +5895,16 @@ func (ms *MutableStateImpl) ApplyWorkflowExecutionOptionsUpdatedEvent(event *his
 
 	// Update priority.
 	if attributes.GetPriority() != nil {
-		if !proto.Equal(ms.executionInfo.Priority, attributes.GetPriority()) {
-			requestReschedulePendingWorkflowTask = true
-		}
+		priorityChanged := !proto.Equal(ms.executionInfo.Priority, attributes.GetPriority())
 		ms.executionInfo.Priority = attributes.GetPriority()
+		if priorityChanged {
+			requestReschedulePendingWorkflowTask = true
+			// Refresh visibility so the TemporalPriorityKey/TemporalFairnessKey search
+			// attributes track the new priority instead of remaining at the start value.
+			if err := ms.taskGenerator.GenerateUpsertVisibilityTask(); err != nil {
+				return err
+			}
+		}
 	}
 
 	// this flag of timeSkippingConfigUpdated is the source of the truth for if the TSC is updated or not

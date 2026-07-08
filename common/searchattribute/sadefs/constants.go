@@ -119,6 +119,17 @@ const (
 	// TemporalExternalPayloadSizeBytes is the total size in bytes of all external payloads
 	// referenced in the entire history tree of the execution.
 	TemporalExternalPayloadSizeBytes = "TemporalExternalPayloadSizeBytes"
+
+	// TemporalPriorityKey is the priority key of the workflow execution, taken from the
+	// execution's Priority. It controls relative ordering of task processing; by convention
+	// lower values are higher priority. Only set when a non-default (non-zero) priority key
+	// is present on the execution.
+	TemporalPriorityKey = "TemporalPriorityKey"
+
+	// TemporalFairnessKey is the fairness key of the workflow execution, taken from the
+	// execution's Priority. It groups executions for fair task dispatching. Only set when a
+	// non-empty fairness key is present on the execution.
+	TemporalFairnessKey = "TemporalFairnessKey"
 )
 
 var (
@@ -187,6 +198,8 @@ var (
 		TemporalUsedWorkerDeploymentVersions: enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST,
 		TemporalExternalPayloadCount:         enumspb.INDEXED_VALUE_TYPE_INT,
 		TemporalExternalPayloadSizeBytes:     enumspb.INDEXED_VALUE_TYPE_INT,
+		TemporalPriorityKey:                  enumspb.INDEXED_VALUE_TYPE_INT,
+		TemporalFairnessKey:                  enumspb.INDEXED_VALUE_TYPE_KEYWORD,
 	}
 
 	// reserved are internal field names that can't be used as search attribute names.

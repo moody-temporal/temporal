@@ -41,6 +41,7 @@ import (
 	"go.temporal.io/server/tests/testcore"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -2523,6 +2524,103 @@ func (s *AdvancedVisibilitySuite) TestListWorkflow_ExternalPayloadSearchAttribut
 
 	query = fmt.Sprintf(`WorkflowId = "%s" AND %s = %d`, id, sadefs.TemporalExternalPayloadSizeBytes, externalPayloadSize)
 	s.testHelperForReadOnce(env, we.GetRunId(), query)
+}
+
+func (s *AdvancedVisibilitySuite) TestListWorkflow_PrioritySearchAttributes(enableUnifiedQueryConverter bool) {
+	env := s.newTestEnv(enableUnifiedQueryConverter)
+	id := "es-functional-priority-test"
+	wt := "es-functional-priority-test-type"
+	tl := "es-functional-priority-test-taskqueue"
+
+	// FairnessWeight is intentionally omitted: it is not surfaced as a search attribute.
+	priorityKey := int32(3)
+	fairnessKey := "es-functional-priority-fairness-key"
+
+	request := &workflowservice.StartWorkflowExecutionRequest{
+		RequestId:           uuid.NewString(),
+		Namespace:           env.Namespace().String(),
+		WorkflowId:          id,
+		WorkflowType:        &commonpb.WorkflowType{Name: wt},
+		TaskQueue:           &taskqueuepb.TaskQueue{Name: tl, Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
+		WorkflowRunTimeout:  durationpb.New(100 * time.Second),
+		WorkflowTaskTimeout: durationpb.New(10 * time.Second),
+		Identity:            "test-identity",
+		Priority: &commonpb.Priority{
+			PriorityKey: priorityKey,
+			FairnessKey: fairnessKey,
+		},
+	}
+
+	we, err := env.FrontendClient().StartWorkflowExecution(s.Context(), request)
+	s.NoError(err)
+
+	// Complete the workflow using the taskpoller API.
+	tv := testvars.New(s.T()).WithTaskQueue(tl)
+	_, err = env.TaskPoller().PollAndHandleWorkflowTask(tv,
+		func(task *workflowservice.PollWorkflowTaskQueueResponse) (*workflowservice.RespondWorkflowTaskCompletedRequest, error) {
+			return &workflowservice.RespondWorkflowTaskCompletedRequest{
+				Commands: []*commandpb.Command{{
+					CommandType: enumspb.COMMAND_TYPE_COMPLETE_WORKFLOW_EXECUTION,
+					Attributes: &commandpb.Command_CompleteWorkflowExecutionCommandAttributes{
+						CompleteWorkflowExecutionCommandAttributes: &commandpb.CompleteWorkflowExecutionCommandAttributes{
+							Result: payloads.EncodeString("Done"),
+						},
+					},
+				}},
+			}, nil
+		},
+	)
+	s.NoError(err)
+
+	query := fmt.Sprintf(`WorkflowId = "%s" AND %s = %d`, id, sadefs.TemporalPriorityKey, priorityKey)
+	s.testHelperForReadOnce(env, we.GetRunId(), query)
+
+	query = fmt.Sprintf(`WorkflowId = "%s" AND %s = "%s"`, id, sadefs.TemporalFairnessKey, fairnessKey)
+	s.testHelperForReadOnce(env, we.GetRunId(), query)
+}
+
+func (s *AdvancedVisibilitySuite) TestListWorkflow_PrioritySearchAttributesUpdatedInFlight(enableUnifiedQueryConverter bool) {
+	env := s.newTestEnv(enableUnifiedQueryConverter)
+	id := "es-functional-priority-update-test"
+	wt := "es-functional-priority-update-test-type"
+	tl := "es-functional-priority-update-test-taskqueue"
+
+	request := &workflowservice.StartWorkflowExecutionRequest{
+		RequestId:           uuid.NewString(),
+		Namespace:           env.Namespace().String(),
+		WorkflowId:          id,
+		WorkflowType:        &commonpb.WorkflowType{Name: wt},
+		TaskQueue:           &taskqueuepb.TaskQueue{Name: tl, Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
+		WorkflowRunTimeout:  durationpb.New(100 * time.Second),
+		WorkflowTaskTimeout: durationpb.New(10 * time.Second),
+		Identity:            "test-identity",
+		Priority:            &commonpb.Priority{PriorityKey: 3, FairnessKey: "original-key"},
+	}
+
+	we, err := env.FrontendClient().StartWorkflowExecution(s.Context(), request)
+	s.NoError(err)
+
+	// The running workflow is queryable at its initial priority (start visibility record).
+	s.testHelperForReadOnce(env, we.GetRunId(),
+		fmt.Sprintf(`WorkflowId = "%s" AND %s = 3`, id, sadefs.TemporalPriorityKey))
+
+	// Change the priority mid-flight with a priority-only options update (no versioning/memo/SA
+	// change). This must enqueue a visibility upsert so the search attributes stop reflecting the
+	// stale start value.
+	updatedPriority := &commonpb.Priority{PriorityKey: 7, FairnessKey: "updated-key"}
+	_, err = env.FrontendClient().UpdateWorkflowExecutionOptions(s.Context(), &workflowservice.UpdateWorkflowExecutionOptionsRequest{
+		Namespace:                env.Namespace().String(),
+		WorkflowExecution:        &commonpb.WorkflowExecution{WorkflowId: id, RunId: we.GetRunId()},
+		WorkflowExecutionOptions: &workflowpb.WorkflowExecutionOptions{Priority: updatedPriority},
+		UpdateMask:               &fieldmaskpb.FieldMask{Paths: []string{"priority"}},
+	})
+	s.NoError(err)
+
+	// Visibility now reflects the updated priority and fairness key for the still-running workflow.
+	s.testHelperForReadOnce(env, we.GetRunId(),
+		fmt.Sprintf(`WorkflowId = "%s" AND %s = 7`, id, sadefs.TemporalPriorityKey))
+	s.testHelperForReadOnce(env, we.GetRunId(),
+		fmt.Sprintf(`WorkflowId = "%s" AND %s = "updated-key"`, id, sadefs.TemporalFairnessKey))
 }
 
 func (s *AdvancedVisibilitySuite) TestScheduleListingWithSearchAttributes(enableUnifiedQueryConverter bool) {

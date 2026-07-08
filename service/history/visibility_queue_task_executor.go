@@ -517,6 +517,27 @@ func (t *visibilityQueueTaskExecutor) getVisibilityRequestBase(
 		searchAttributes = getSearchAttributes(copyMapPayload(searchAttributesMap))
 	)
 
+	// Surface the execution's priority key and fairness key as predefined search
+	// attributes so that running and closed workflows can be filtered by them. Only
+	// non-default values are indexed: priority key 0 and empty fairness key are the
+	// unset defaults and are omitted to avoid indexing them for every workflow.
+	if priority := executionInfo.GetPriority(); priority.GetPriorityKey() != 0 || priority.GetFairnessKey() != "" {
+		if searchAttributes == nil {
+			searchAttributes = &commonpb.SearchAttributes{}
+		}
+		if searchAttributes.IndexedFields == nil {
+			searchAttributes.IndexedFields = make(map[string]*commonpb.Payload)
+		}
+		if priority.GetPriorityKey() != 0 {
+			searchAttributes.IndexedFields[sadefs.TemporalPriorityKey] =
+				sadefs.MustEncodeValue(int64(priority.GetPriorityKey()), enumspb.INDEXED_VALUE_TYPE_INT)
+		}
+		if priority.GetFairnessKey() != "" {
+			searchAttributes.IndexedFields[sadefs.TemporalFairnessKey] =
+				sadefs.MustEncodeValue(priority.GetFairnessKey(), enumspb.INDEXED_VALUE_TYPE_KEYWORD)
+		}
+	}
+
 	var parentExecution *commonpb.WorkflowExecution
 	if executionInfo.ParentWorkflowId != "" && executionInfo.ParentRunId != "" {
 		parentExecution = &commonpb.WorkflowExecution{
