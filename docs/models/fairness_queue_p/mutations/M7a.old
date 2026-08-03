@@ -1,0 +1,1 @@
+    if (mode == MERGE_READ_MIDDLE || evictedAny) {

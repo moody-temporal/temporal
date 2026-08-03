@@ -1,0 +1,5 @@
+      } else {
+        assert !(lvl in isNew), "duplicate level in merge batch";
+        merged = insertSorted(merged, lvl);
+        isNew += (lvl);
+      }

@@ -1,0 +1,7 @@
+    on eTaskLoaded do (t: (lvl: int, id: int)) {
+      if (t in evictedEarly) {
+        // this instance was evicted before it reached the matcher
+        evictedEarly -= (t);
+        return;
+      }
+      pending += (t);

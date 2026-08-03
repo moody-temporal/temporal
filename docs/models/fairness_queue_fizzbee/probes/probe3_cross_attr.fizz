@@ -1,0 +1,33 @@
+---
+options:
+  crash_on_yield: false
+deadlock_detection: false
+---
+
+# Probe 3: can one role's action assign another role's scalar attribute?
+# And can a role action reassign a top-level global scalar?
+
+role A:
+    action Init:
+        self.val = 0
+
+    atomic action Poke:
+        require b.val == 0
+        b.val = 1
+
+role B:
+    action Init:
+        self.val = 0
+
+    atomic action React:
+        require self.val == 1
+        self.val = 2
+        done = True
+
+action Init:
+    a = A()
+    b = B()
+    done = False
+
+exists assertion Finished:
+    return done and b.val == 2

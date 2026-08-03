@@ -1,0 +1,3 @@
+    on eTaskLoaded do (t: (lvl: int, id: int)) {
+      // M8a: no setEvicted flag; a late matcher add proceeds (pre-ad717eae)
+      pending += (t);

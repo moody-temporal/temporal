@@ -1,0 +1,486 @@
+---
+# Milestone 5: M4 + the evicted-ack cache.
+# When acked (nil) entries are evicted from outstandingTasks because the
+# read level regressed below them, the real code remembers them in a small
+# bounded cache (evictedAcks, trimmed from the top). When such a task is
+# re-read later, it is merged as a pre-acked entry instead of being
+# re-delivered to the matcher. The cache is a pure optimization: every
+# safety/liveness property of M4 must still hold. The dangerous property is
+# that ONLY genuinely-acked tasks may enter the cache — a cached level that
+# was never dispatched would be silently skipped (lost task).
+# The cache size is 1 here (256 in the code) so trimming is exercised.
+#
+# Inherited from M4: unreliable DB (timeouts, retries, backoff races).
+#
+# Failure modes added (no "explicit failure"/conflict errors, per plan):
+#  - GetFairTasks may time out: no side effects; the reader arms the backoff
+#    timer (retryReadAfter) and exits the read loop; the timer restarts the
+#    read (fix 26d9a561: the timer can fire before readTasksImpl finishes,
+#    so readTasksImpl re-checks maybeReadTasksLocked at the end).
+#  - CreateFairTasks may time out on the outgoing side (not applied) or the
+#    incoming side (applied, response lost). Either way writeBatch skips
+#    wroteNewTasks (tasks are NOT confirmed) and unpinAckLevel(err) sets
+#    atEnd = false and triggers a read to re-establish the end (8ca7b640 #5).
+#    History's retry writes a fresh task at a new level; an applied-but-
+#    unconfirmed "zombie" row may be dispatched later (dup, allowed) or be
+#    passed over by the ack level and GC'd (it carries no obligations).
+#
+# Read outcomes use `fair any`, i.e. the network-fairness assumption that a
+# forever-retried read eventually succeeds; without it liveness would
+# trivially fail on the fail-forever path.
+options:
+  max_actions: 100
+  max_concurrent_actions: 2
+  crash_on_yield: false
+deadlock_detection: false   # "all written tasks acked" is a valid final state
+liveness: strict
+---
+
+MAX_LEVEL = 3    # universe of task levels: 1..MAX_LEVEL, each used at most once
+                 # (one less than M2/M3: failure branching grows the space)
+EVICTED_ACKS_CACHE_SIZE = 1   # evictedAcksCacheSize (256 in the code)
+BATCH_SIZE = 2   # config.GetTasksBatchSize()
+RELOAD_AT = 1    # config.GetTasksReloadAt(): read more iff loaded <= RELOAD_AT
+
+# outstandingTasks values (code: *internalTask vs nil)
+LOADED = "LOADED"
+ACKED = "ACKED"
+
+# reader read-machinery state (code: readPending + position in readTasksImpl)
+#   ERR_ARM:  GetFairTasks returned an error; retryReadAfter not yet run
+#   ERR_EXIT: backoff timer armed; loop will see lastErr and exit
+RS = enum('IDLE', 'LOOP', 'REQ', 'RESP', 'ERR_ARM', 'ERR_EXIT')
+
+# writer state (code: position in fairTaskWriter.writeBatch)
+#   IDLE:  no write in progress
+#   REQ:   ack level pinned, CreateFairTasks sent to DB
+#   RESP:  DB applied the write and responded; wroteNewTasks not yet run
+#   UNPIN: merge done, unpinAckLevel not yet run
+#   ERR:   write timed out (applied or not); unpinAckLevel(err) not yet run
+WS = enum('IDLE', 'REQ', 'RESP', 'UNPIN', 'ERR')
+
+# merge modes (code: mergeReadMiddle / mergeReadToEnd / mergeWrite)
+MODE_MIDDLE = "READ_MIDDLE"
+MODE_TO_END = "READ_TO_END"
+MODE_WRITE = "WRITE"
+
+action Init:
+    # --- database state ---
+    db_tasks = set()
+
+    # --- reader state (fairTaskReader fields) ---
+    outstanding = {}       # outstandingTasks: level -> LOADED | ACKED
+    read_level = 0         # readLevel
+    ack_level = 0          # ackLevel
+    at_end = False         # atEnd
+    newly_written = []     # newlyWrittenTasks
+    pinned_by_writer = False   # ackLevelPinnedByWriter
+    backoff_timer = False  # backoffTimer != nil
+
+    # --- writer state ---
+    writer_state = WS.IDLE
+    write_req = None       # levels of the in-flight write batch, or None
+
+    # --- "network" between reader/writer/GC and DB ---
+    read_req = None        # (readFrom-exclusive, batchSize) or None
+    read_resp = None       # (levels list, hitEnd bool) or None
+
+    # --- ghost variables (assertions only) ---
+    confirmed = set()      # tasks whose write was confirmed to the writer
+    ever_acked = set()     # tasks that were acked at least once
+    expired = set()        # tasks that have expired (monotonic)
+
+    # --- evicted-ack cache (reader state, fairTaskReader.evictedAcks) ---
+    evicted_acks = set()
+    ever_cache_hit = False   # ghost: a re-read task hit the cache
+
+    # Start(): initial maybeReadTasksLocked. Empty queue, nothing loaded:
+    read_state = RS.LOOP
+
+###############################################################################
+# helpers: fairTaskReader methods, called under tr.lock
+###############################################################################
+
+atomic func loaded_count():
+    # tr.loadedTasks (derived instead of tracked; the code asserts they match)
+    return len([l for l in outstanding if outstanding[l] == LOADED])
+
+atomic func should_read_more():
+    # shouldReadMoreLocked
+    if at_end:
+        return False
+    lc = loaded_count()
+    if lc > RELOAD_AT:
+        return False
+    return True
+
+atomic func maybe_read():
+    # maybeReadTasksLocked: abort if a read is pending, we shouldn't read,
+    # or we're in the middle of a backoff
+    if read_state != RS.IDLE or backoff_timer:
+        return
+    srm = should_read_more()
+    if srm:
+        read_state = RS.LOOP
+
+atomic func ack_pinned():
+    # ackLevelPinnedLocked
+    return pinned_by_writer or len(newly_written) > 0
+
+atomic func advance_ack():
+    # advanceAckLevelLocked
+    pinned = ack_pinned()
+    if pinned:
+        return
+    for _ in range(MAX_LEVEL + 1):
+        if len(outstanding) == 0:
+            break
+        m = min(outstanding.keys())
+        if outstanding[m] != ACKED:
+            break
+        ack_level = m
+        outstanding.pop(m)
+
+atomic func merge_tasks(tasks, mode):
+    # mergeTasksLocked. tasks: list of levels just read or written.
+
+    # (1) currently loaded tasks + (2) incoming tasks, filtered:
+    incoming = []
+    for t in tasks:
+        if t <= ack_level:
+            # reads race acks: ignore tasks already at-or-below ack level
+            continue
+        elif mode == MODE_WRITE and not at_end and t > read_level:
+            # not at end: can't accept writes above read level (unknown gap)
+            continue
+        elif t in outstanding:
+            # already have it (loaded or acked)
+            continue
+        incoming.append(t)
+    loaded_levels = [l for l in outstanding if outstanding[l] == LOADED]
+    merged = sorted(loaded_levels + incoming)
+
+    # keep the first BATCH_SIZE in memory
+    keep = merged[:BATCH_SIZE]
+    dropped = merged[BATCH_SIZE:]
+
+    if len(keep) > 0:
+        # readLevel = max level of what we keep in memory
+        read_level = keep[-1]
+    # else: merged is empty, leave read_level unchanged (fix f534e74e)
+
+    evicted_any = False
+    # evict loaded tasks that no longer fit (dropped incoming are just ignored)
+    for t in dropped:
+        evicted_any = True
+        if outstanding.get(t, None) == LOADED:
+            outstanding.pop(t)
+            # the task is still in the DB; it will be re-read later
+
+    # evict acks above the new read level (fix 8ca7b640 #4), remembering
+    # them in the evicted-ack cache so a later re-read can skip them
+    for t in [l for l in outstanding if outstanding[l] == ACKED and l > read_level]:
+        outstanding.pop(t)
+        evicted_acks.add(t)
+        evicted_any = True
+    # trim the cache to capacity by removing the highest levels
+    for t in sorted(evicted_acks, reverse=True):
+        if len(evicted_acks) <= EVICTED_ACKS_CACHE_SIZE:
+            break
+        evicted_acks.discard(t)
+
+    # add the kept incoming tasks to memory; tasks whose evicted ack is
+    # cached, and expired tasks, are added as pre-acked (nil) entries so
+    # they advance readLevel/ackLevel and get GC'd instead of being
+    # re-delivered to the matcher (fix 0b372d5e; evicted-ack cache)
+    for t in keep:
+        if t not in outstanding:
+            if t in evicted_acks:
+                # re-read of a task whose ack was evicted: pre-ack it and
+                # drop it from the cache (it's tracked in outstanding again)
+                outstanding[t] = ACKED
+                evicted_acks.discard(t)
+                ever_cache_hit = True
+            elif t in expired:
+                outstanding[t] = ACKED
+            else:
+                outstanding[t] = LOADED
+
+    # advance ack level (matters for expired/pre-acked entries, M3+)
+    advance_ack()
+
+    # update atEnd
+    if mode == MODE_MIDDLE or evicted_any:
+        at_end = False
+    elif mode == MODE_TO_END:
+        at_end = True
+
+###############################################################################
+# reader process
+###############################################################################
+
+atomic fair action ReaderReadLoop:
+    # one iteration of the readTasksImpl for-loop (top of loop, under lock)
+    require read_state == RS.LOOP or read_state == RS.ERR_EXIT
+    if read_state == RS.ERR_EXIT:
+        srm = False   # lastErr != nil: break out of the loop
+    else:
+        srm = should_read_more()
+    if srm:
+        # readTaskBatch: send GetFairTasks(readLevel+1, batch) to the DB
+        lc = loaded_count()
+        read_req = (read_level, BATCH_SIZE - lc)
+        read_state = RS.REQ
+    else:
+        # exit loop: readPending = false, process newlyWrittenTasks, then
+        # re-check maybeReadTasksLocked (fix 26d9a561: the backoff timer may
+        # have fired while readPending was still true and given up)
+        read_state = RS.IDLE
+        if len(newly_written) > 0:
+            merge_tasks(newly_written, MODE_WRITE)
+            newly_written = []
+            # ack level was pinned by newlyWrittenTasks during the merge;
+            # it may be able to advance now
+            advance_ack()
+        maybe_read()
+
+atomic fair action ReaderRetryArm:
+    # retryReadAfter: arm the backoff timer (its own lock acquisition,
+    # between the failed DB call and the loop noticing lastErr)
+    require read_state == RS.ERR_ARM
+    if not backoff_timer:
+        backoff_timer = True
+    read_state = RS.ERR_EXIT
+
+atomic fair action BackoffTimerFire:
+    # the backoff timer fires: backoffTimer = nil; maybeReadTasksLocked.
+    # This can happen while the read loop is still winding down (readPending
+    # true), in which case maybe_read is a no-op — the 26d9a561 race.
+    require backoff_timer
+    backoff_timer = False
+    maybe_read()
+
+atomic fair action ReaderMergeRead:
+    # response arrived: retrier.Reset(); mergeTasks(res, mode); loop again
+    require read_state == RS.RESP
+    tasks = read_resp[0]
+    hit_end = read_resp[1]
+    read_resp = None
+    read_state = RS.LOOP
+    if hit_end:
+        merge_tasks(tasks, MODE_TO_END)
+    else:
+        merge_tasks(tasks, MODE_MIDDLE)
+
+###############################################################################
+# writer process (fairTaskWriter.writeBatch)
+###############################################################################
+
+atomic action WriterWrite:
+    # taskWriterLoop got an AddTask request: getAndPinAckLevels, pickPasses
+    # (level above the pinned ack level, any unused level), CreateFairTasks.
+    require writer_state == WS.IDLE
+    # A level is available iff not already in the DB (db_tasks is monotone
+    # with GC unmodeled, so this equals "never successfully written"). Real
+    # ids are never reused, but a timed-out-unapplied write leaves no trace,
+    # so reusing its level explores an isomorphic behavior while keeping the
+    # level universe small (and dedups the retry states).
+    avail = [l + 1 for l in range(MAX_LEVEL) if l + 1 not in db_tasks and l + 1 > ack_level]
+    require len(avail) > 0
+    t = oneof avail
+    pinned_by_writer = True   # getAndPinAckLevel (softassert: wasn't pinned)
+    write_req = [t]
+    writer_state = WS.REQ
+
+atomic fair action DbWrite:
+    # DB handles CreateFairTasks: it may succeed, time out before being
+    # applied (outgoing), or be applied with the response lost (incoming)
+    require writer_state == WS.REQ
+    outcome = oneof ["ok", "timeout_applied", "timeout_not_applied"]
+    if outcome != "timeout_not_applied":
+        for t in write_req:
+            db_tasks.add(t)
+    if outcome == "ok":
+        writer_state = WS.RESP
+    else:
+        writer_state = WS.ERR
+
+atomic fair action WriterWriteError:
+    # writeBatch error path: wroteNewTasks is NOT called (nothing confirmed),
+    # then unpinAckLevel(writeErr != nil): we can't know where the end is
+    # anymore, so atEnd = false and start a read to find it (8ca7b640 #5)
+    require writer_state == WS.ERR
+    at_end = False
+    maybe_read()
+    pinned_by_writer = False   # softassert: was pinned
+    advance_ack()
+    write_req = None
+    writer_state = WS.IDLE
+
+atomic fair action WriterMergeWrite:
+    # write returned success: backlogMgr.wroteNewTasks -> tr.mergeTasks(WRITE)
+    require writer_state == WS.RESP
+    for t in write_req:
+        confirmed.add(t)
+    if read_state != RS.IDLE:
+        # concurrent read: hold the just-written tasks, merge after the read
+        # (fix 12e7c43a)
+        newly_written = sorted(newly_written + write_req)
+    else:
+        merge_tasks(write_req, MODE_WRITE)
+        # "fair reader stuck" softassert (fair_task_reader.go mergeTasks),
+        # plus the defensive backstop read the real code performs.
+        #
+        # FINDING (M3): unlike M2, this state IS reachable once tasks can
+        # expire: with only pre-acked entries in memory (loaded == 0), a
+        # write whose task expired in flight merges as pre-acked while the
+        # ack level is pinned; readLevel regresses, the older acks get
+        # evicted, atEnd goes false, and nothing is loaded. The softassert
+        # fires in the real code, and the backstop read is load-bearing:
+        # without it the reader never reads again and later writes above
+        # readLevel are dropped from memory forever (liveness violation).
+        # See StuckStateReachable below.
+        lc = loaded_count()
+        if not at_end and lc == 0:
+            maybe_read()
+    write_req = None
+    writer_state = WS.UNPIN
+
+atomic fair action WriterUnpin:
+    # unpinAckLevel(nil)
+    require writer_state == WS.UNPIN
+    pinned_by_writer = False   # softassert: was pinned
+    advance_ack()
+    writer_state = WS.IDLE
+
+###############################################################################
+# expiry: any task still sitting in the DB may expire at any time
+###############################################################################
+
+atomic action ExpireTask:
+    # unfair: expiry may or may not happen. At most ONE task ever expires
+    # here: full expiry semantics are exhaustively checked in m3; this keeps
+    # every pairwise expiry-x-failure (and expiry-x-cache) interaction
+    # reachable at a fraction of the state space.
+    require len(expired) == 0
+    candidates = [t for t in db_tasks if t not in ever_acked]
+    require len(candidates) > 0
+    t = oneof candidates
+    expired.add(t)
+
+###############################################################################
+# acker process: eventually acks every loaded task
+###############################################################################
+
+atomic fair action AckTask:
+    # completeTask happy path -> completeTaskLocked
+    loaded = [l for l in outstanding if outstanding[l] == LOADED]
+    require len(loaded) > 0
+    # fair choice: every loaded task is eventually acked (every dispatched
+    # task eventually completes); plain oneof would allow starvation cycles
+    t = fair any loaded
+    outstanding[t] = ACKED
+    ever_acked.add(t)
+    advance_ack()
+    maybe_read()
+
+# NOTE: the GC process is deliberately NOT modeled (review decision): GC only
+# issues "delete where level <= ackLevel", which is safe by construction as
+# long as AckLevelOnlyPassesAcked holds — that property IS the "never GC an
+# unacked task" property. Failure/retry of the delete is idempotent and
+# carries no obligations, so modeling it only multiplied the state space.
+
+###############################################################################
+# database process: executes reads
+###############################################################################
+
+atomic fair action DbRead:
+    # DB handles GetFairTasks: success or timeout (reads have no side
+    # effects, so applied-vs-not doesn't matter). `fair any` = network
+    # fairness: retried forever, the read eventually succeeds.
+    require read_state == RS.REQ
+    outcome = fair any ["ok", "timeout"]
+    if outcome == "ok":
+        from_level = read_req[0]
+        batch = read_req[1]
+        res = sorted([t for t in db_tasks if t > from_level])[:batch]
+        read_req = None
+        read_resp = (res, len(res) < batch)
+        read_state = RS.RESP
+    else:
+        read_req = None
+        read_state = RS.ERR_ARM
+
+###############################################################################
+# properties
+###############################################################################
+
+always assertion MemoryInWindow:
+    # in-memory tasks (and pending acks) are exactly within (ackLevel, readLevel]
+    if ack_level > read_level:
+        return False
+    for l in outstanding:
+        if l <= ack_level or l > read_level:
+            return False
+    return True
+
+always assertion WindowComplete:
+    # everything at-or-below readLevel is accounted for: a confirmed task
+    # still in the DB and inside (ackLevel, readLevel] must be tracked in
+    # outstandingTasks or held in newlyWrittenTasks — otherwise the reader
+    # would never re-read it and it would never be dispatched.
+    for t in confirmed:
+        if t in db_tasks and t > ack_level and t <= read_level:
+            if t not in outstanding and t not in newly_written:
+                return False
+    return True
+
+always assertion AckLevelOnlyPassesAcked:
+    # (This also covers "never GC an unacked task": GC only deletes rows at
+    # or below a previously observed ackLevel, and ackLevel is monotonic.)
+    # if the ack level moved past a confirmed task, it must have been
+    # acked or expired
+    for t in confirmed:
+        if t <= ack_level and t not in ever_acked and t not in expired:
+            return False
+    return True
+
+transition assertion AckLevelMonotonic(before, after):
+    return after.ack_level >= before.ack_level
+
+# main liveness property: every confirmed task is eventually acked-or-expired
+# and the ack level eventually passes every confirmed task (reader never gets
+# stuck — in particular not on a batch of entirely expired tasks)
+eventually always assertion AllConfirmedTasksAcked:
+    remaining = len([t for t in confirmed if t not in ever_acked and t not in expired])
+    behind = len([t for t in confirmed if t > ack_level])
+    return remaining == 0 and behind == 0
+
+# sanity: interesting states are actually reachable
+exists assertion BufferFills:
+    return len([l for l in outstanding if outstanding[l] == LOADED]) == BATCH_SIZE
+
+exists assertion WriteBufferedDuringRead:
+    return len(newly_written) > 0
+
+exists assertion ReachesEnd:
+    return at_end
+
+exists assertion BackoffTimerArms:
+    return backoff_timer
+
+exists assertion ZombieRowExists:
+    # a write timed out but was applied: unconfirmed row sits in the DB
+    return writer_state == WS.IDLE and len([t for t in db_tasks if t not in confirmed]) > 0
+
+always assertion CacheOnlyHoldsAcked:
+    # the evicted-ack cache must never contain a task that wasn't acked
+    # (a bogus entry would make a re-read skip an undispatched task)
+    for t in evicted_acks:
+        if t not in ever_acked and t not in expired:
+            return False
+    return True
+
+exists assertion CacheHitHappens:
+    return ever_cache_hit
+

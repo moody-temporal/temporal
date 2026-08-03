@@ -1,0 +1,3 @@
+      announce eTaskCompleted, lvl;
+      advanceAckLevel();
+      checkInvariants();

@@ -1,0 +1,7 @@
+      if (hadErr) {
+        // the write may have taken effect anyway: we can't assume we know
+        // where the end is anymore, and must initiate a read to find it
+        // (8ca7b640 #5)
+        atEnd = false;
+        maybeRead();
+      }

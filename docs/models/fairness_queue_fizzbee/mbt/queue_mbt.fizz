@@ -1,0 +1,290 @@
+---
+# Model-based-testing variant of the fair task queue model (see ../m5.fizz).
+#
+# This spec drives the REAL fairTaskReader/fairTaskWriter through a test
+# adapter (service/matching/fizz_mbt_*_test.go), so its actions are collapsed
+# to the points where the adapter can actually pause the code: persistence
+# calls parked in a gating TaskManager wrapper, task completion, and task
+# expiry. Between actions the SUT is quiescent (all goroutines parked at the
+# gate or idle), and every state variable below is read directly from the
+# SUT for comparison after every action.
+#
+# Differences from m5 (model-checking variant):
+#  - The read loop is collapsed: "pending read request" (read_from/read_batch
+#    != -1) corresponds to a real GetTasks call parked at the gate. Issuing a
+#    read (maybeReadTasksLocked -> readTasksImpl -> GetFairTasks) happens
+#    inside other actions; DbReadOk both merges the response and runs the
+#    loop continuation (next read / exit + newlyWrittenTasks + re-check).
+#  - The writer is collapsed to WriterWrite (pin + pick level + park at
+#    CreateTasks) and WriterWriteOk/WriterWriteTimeout (release the parked
+#    call; merge-or-buffer + unpin happen synchronously in the SUT before it
+#    quiesces, so they are part of the same spec action).
+#  - No read timeouts / backoff timer (the real timer is wall-clock and the
+#    adapter cannot interleave it deterministically) and no GC (not modeled,
+#    see ../m5.fizz).
+#  - No liveness (MBT checks trace conformance, not liveness).
+options:
+  max_actions: 100
+  max_concurrent_actions: 2
+  crash_on_yield: false
+deadlock_detection: false
+---
+
+MAX_LEVEL = 3    # levels 1..MAX_LEVEL; single int level == fairLevel.pass
+                 # (the adapter forces the writer's pass via the injected
+                 # counter; ids only tie-break equal passes, never used here)
+BATCH_SIZE = 2   # config GetTasksBatchSize (set via dynamic config in test)
+RELOAD_AT = 1    # config GetTasksReloadAt
+
+LOADED = "LOADED"
+ACKED = "ACKED"
+
+MODE_MIDDLE = "READ_MIDDLE"
+MODE_TO_END = "READ_TO_END"
+MODE_WRITE = "WRITE"
+
+role Queue:
+    action Init:
+        # observable SUT state (see adapter GetState):
+        self.db = set()          # levels present in the fake store
+        self.outstanding = {}    # tr.outstandingTasks: level -> LOADED|ACKED
+        self.read_level = 0      # tr.readLevel.pass
+        self.ack_level = 0       # tr.ackLevel.pass
+        self.at_end = False      # tr.atEnd
+        self.newly_written = []  # tr.newlyWrittenTasks levels, sorted
+        self.pinned = False      # tr.ackLevelPinnedByWriter
+        self.evicted_acks = set()  # tr.evictedAcks levels
+        self.read_from = -1      # parked GetTasks: exclusive-min level, or -1
+        self.read_batch = 0      # parked GetTasks: batch size, or 0
+        self.write_req = -1      # parked CreateTasks: level, or -1
+        # adapter-tracked ghosts:
+        self.confirmed = set()   # writes acknowledged to the caller
+        self.ever_acked = set()  # tasks completed at least once
+        self.expired = set()     # tasks whose ExpiryTime was set to the past
+
+        # blm.Start(): the reader immediately issues a read that parks at
+        # the gate, so the initial stable state has a pending read.
+        self.read_from = 0
+        self.read_batch = BATCH_SIZE
+
+    ###########################################################################
+    # helpers (mirror fairTaskReader logic; see ../m5.fizz for line-by-line
+    # commentary — kept in sync manually)
+    ###########################################################################
+
+    atomic func loaded_count():
+        return len([l for l in self.outstanding if self.outstanding[l] == LOADED])
+
+    atomic func should_read_more():
+        if self.at_end:
+            return False
+        lc = self.loaded_count()
+        if lc > RELOAD_AT:
+            return False
+        return True
+
+    atomic func maybe_read():
+        # maybeReadTasksLocked + the spawned readTasksImpl running until it
+        # parks its GetFairTasks call at the gate (collapsed)
+        if self.read_from != -1:
+            return
+        srm = self.should_read_more()
+        if srm:
+            lc = self.loaded_count()
+            self.read_from = self.read_level
+            self.read_batch = BATCH_SIZE - lc
+
+    atomic func ack_pinned():
+        return self.pinned or len(self.newly_written) > 0
+
+    atomic func advance_ack():
+        p = self.ack_pinned()
+        if p:
+            return
+        for _ in range(MAX_LEVEL + 1):
+            if len(self.outstanding) == 0:
+                break
+            m = min(self.outstanding.keys())
+            if self.outstanding[m] != ACKED:
+                break
+            self.ack_level = m
+            self.outstanding.pop(m)
+
+    atomic func merge_tasks(tasks, mode):
+        # mergeTasksLocked (with the evicted-ack cache; cache trimming is
+        # unreachable at this scale — code cap is 256)
+        incoming = []
+        for t in tasks:
+            if t <= self.ack_level:
+                continue
+            elif mode == MODE_WRITE and not self.at_end and t > self.read_level:
+                continue
+            elif t in self.outstanding:
+                continue
+            incoming.append(t)
+        loaded_levels = [l for l in self.outstanding if self.outstanding[l] == LOADED]
+        merged = sorted(loaded_levels + incoming)
+
+        keep = merged[:BATCH_SIZE]
+        dropped = merged[BATCH_SIZE:]
+
+        if len(keep) > 0:
+            self.read_level = keep[-1]
+        # else: leave read_level unchanged (fix f534e74e)
+
+        evicted_any = False
+        for t in dropped:
+            evicted_any = True
+            if self.outstanding.get(t, None) == LOADED:
+                self.outstanding.pop(t)
+
+        for t in [l for l in self.outstanding if self.outstanding[l] == ACKED and l > self.read_level]:
+            self.outstanding.pop(t)
+            self.evicted_acks.add(t)
+            evicted_any = True
+
+        for t in keep:
+            if t not in self.outstanding:
+                if t in self.evicted_acks:
+                    self.outstanding[t] = ACKED
+                    self.evicted_acks.discard(t)
+                elif t in self.expired:
+                    self.outstanding[t] = ACKED
+                else:
+                    self.outstanding[t] = LOADED
+
+        self.advance_ack()
+
+        if mode == MODE_MIDDLE or evicted_any:
+            self.at_end = False
+        elif mode == MODE_TO_END:
+            self.at_end = True
+
+    ###########################################################################
+    # actions == adapter interception points
+    ###########################################################################
+
+    atomic action WriterWrite:
+        # SpoolTask: writeBatch pins the ack level, pickPasses returns the
+        # chosen level (injected counter), CreateFairTasks parks at the gate.
+        require self.write_req == -1
+        avail = [l + 1 for l in range(MAX_LEVEL) if l + 1 not in self.db and l + 1 > self.ack_level]
+        require len(avail) > 0
+        t = oneof avail
+        self.pinned = True
+        self.write_req = t
+
+    atomic action WriterWriteOk:
+        # release the parked CreateTasks successfully; the SUT then runs
+        # wroteNewTasks (merge or buffer into newlyWrittenTasks) and
+        # unpinAckLevel(nil) before quiescing
+        require self.write_req != -1
+        t = self.write_req
+        self.db.add(t)
+        self.confirmed.add(t)
+        if self.read_from != -1:
+            # readPending: buffered (fix 12e7c43a)
+            self.newly_written = sorted(self.newly_written + [t])
+        else:
+            self.merge_tasks([t], MODE_WRITE)
+            # "fair reader stuck" defensive backstop read
+            lc = self.loaded_count()
+            if not self.at_end and lc == 0:
+                self.maybe_read()
+        self.write_req = -1
+        self.pinned = False
+        self.advance_ack()
+
+    atomic action WriterWriteTimeout:
+        # release the parked CreateTasks with a timeout error, either after
+        # applying the write (response lost) or without applying it; the SUT
+        # then runs unpinAckLevel(err): atEnd = false + read trigger
+        # (8ca7b640 #5). The task is NOT confirmed (history sees an error).
+        require self.write_req != -1
+        applied = oneof [True, False]
+        if applied:
+            self.db.add(self.write_req)
+        self.write_req = -1
+        self.at_end = False
+        self.maybe_read()
+        self.pinned = False
+        self.advance_ack()
+
+    atomic action DbReadOk:
+        # release the parked GetTasks with the real store's result; the SUT
+        # merges it and continues the read loop until it parks the next
+        # GetTasks or exits (processing newlyWrittenTasks + re-check, fix
+        # 26d9a561)
+        require self.read_from != -1
+        res = sorted([t for t in self.db if t > self.read_from])[:self.read_batch]
+        hit_end = len(res) < self.read_batch
+        self.read_from = -1
+        self.read_batch = 0
+        if hit_end:
+            self.merge_tasks(res, MODE_TO_END)
+        else:
+            self.merge_tasks(res, MODE_MIDDLE)
+        srm = self.should_read_more()
+        if srm:
+            lc = self.loaded_count()
+            self.read_from = self.read_level
+            self.read_batch = BATCH_SIZE - lc
+        else:
+            if len(self.newly_written) > 0:
+                self.merge_tasks(self.newly_written, MODE_WRITE)
+                self.newly_written = []
+                self.advance_ack()
+            self.maybe_read()
+
+    atomic action AckTask:
+        # the "matcher" completes a dispatched task: task.finish ->
+        # completeTask -> ack + advance + maybeReadTasksLocked
+        loaded = [l for l in self.outstanding if self.outstanding[l] == LOADED]
+        require len(loaded) > 0
+        t = oneof loaded
+        self.outstanding[t] = ACKED
+        self.ever_acked.add(t)
+        self.advance_ack()
+        self.maybe_read()
+
+    atomic action ExpireTask:
+        # the adapter rewrites the stored task's ExpiryTime to the past;
+        # observable only at the next merge of that task
+        candidates = [t for t in self.db if t not in self.ever_acked and t not in self.expired]
+        require len(candidates) > 0
+        t = oneof candidates
+        self.expired.add(t)
+
+action Init:
+    q = Queue()
+
+###############################################################################
+# properties (safety only; liveness is checked by the m-series models)
+###############################################################################
+
+always assertion MemoryInWindow:
+    if q.ack_level > q.read_level:
+        return False
+    for l in q.outstanding:
+        if l <= q.ack_level or l > q.read_level:
+            return False
+    return True
+
+always assertion WindowComplete:
+    for t in q.confirmed:
+        if t in q.db and t > q.ack_level and t <= q.read_level:
+            if t not in q.outstanding and t not in q.newly_written:
+                return False
+    return True
+
+always assertion AckLevelOnlyPassesAcked:
+    for t in q.confirmed:
+        if t <= q.ack_level and t not in q.ever_acked and t not in q.expired:
+            return False
+    return True
+
+always assertion CacheOnlyHoldsAcked:
+    for t in q.evicted_acks:
+        if t not in q.ever_acked and t not in q.expired:
+            return False
+    return True

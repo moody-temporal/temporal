@@ -1,0 +1,34 @@
+---
+options:
+  crash_on_yield: false
+deadlock_detection: false
+---
+
+# Probe 2: cross-role func calls from an atomic top-level action:
+# with crash_on_yield false, is message loss injected (extra branches)?
+# Also: can a role func mutate self scalars (definitely should work)?
+
+role Server:
+    action Init:
+        self.count = 0
+
+    atomic func Incr():
+        self.count = self.count + 1
+        return self.count
+
+action Init:
+    server = Server()
+    observed = 0
+
+atomic action CallServer:
+    require server.count < 2
+    r = server.Incr()
+    observed = r
+
+always assertion NoLostCall:
+    # If message loss is injected, server.count could advance without
+    # observed following (response lost), or the call could be dropped.
+    return observed == server.count
+
+exists assertion Progressed:
+    return server.count == 2

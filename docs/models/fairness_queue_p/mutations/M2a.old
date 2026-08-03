@@ -1,0 +1,9 @@
+      if (readPending) {
+        i = 0;
+        while (i < sizeof(batch)) {
+          newlyWritten += (sizeof(newlyWritten), batch[i]);
+          i = i + 1;
+        }
+        return;
+      }
+      mergeTasks(batch, MERGE_WRITE);

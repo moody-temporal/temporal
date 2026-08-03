@@ -1,0 +1,8 @@
+      } else if (isExpired(lvl)) {
+        // M5a: drop expired tasks before they enter the merged set
+        announce eTaskExpired, lvl;
+      } else {
+        assert !(lvl in isNew), "duplicate level in merge batch";
+        merged = insertSorted(merged, lvl);
+        isNew += (lvl);
+      }

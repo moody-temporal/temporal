@@ -1,0 +1,20 @@
+---
+options:
+  crash_on_yield: false
+deadlock_detection: false
+---
+
+# Probe 1: can a top-level func reassign a scalar global state var?
+
+atomic func bump():
+    counter = counter + 1
+
+action Init:
+    counter = 0
+
+atomic action Bump:
+    require counter < 2
+    bump()
+
+exists assertion Bumped:
+    return counter == 2

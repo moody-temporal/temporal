@@ -1,0 +1,257 @@
+---
+# Milestone 1: sequential core — reader + acker over a reliable DB.
+# No writer yet: the DB is pre-populated with NUM_TASKS tasks.
+# Models fair_task_reader.go: readTasksImpl loop, mergeTasksLocked (read modes
+# only), advanceAckLevelLocked. Every atomic action here corresponds to a
+# region executed under tr.lock (or inside the DB); interleaving between
+# actions models concurrency between the reader goroutines, the acker and
+# the DB. (GC is deliberately not modeled — see the note above the database
+# process section.)
+options:
+  max_actions: 100
+  max_concurrent_actions: 2
+  crash_on_yield: false
+deadlock_detection: false   # "all tasks acked" is a valid terminal state
+liveness: strict
+---
+
+NUM_TASKS = 4    # tasks pre-populated at levels 1..NUM_TASKS
+BATCH_SIZE = 2   # config.GetTasksBatchSize()
+RELOAD_AT = 1    # config.GetTasksReloadAt(): read more iff loaded <= RELOAD_AT
+
+# outstandingTasks values (code: *internalTask vs nil)
+LOADED = "LOADED"
+ACKED = "ACKED"
+
+# reader read-machinery state (code: readPending + position in readTasksImpl)
+#   IDLE: no read pending (readPending == false)
+#   LOOP: readTasksImpl running, about to check shouldReadMoreLocked
+#   REQ:  GetFairTasks call sent to DB, waiting (read_req holds params)
+#   RESP: DB responded, merge not yet processed (read_resp holds result)
+RS = enum('IDLE', 'LOOP', 'REQ', 'RESP')
+
+# merge modes (code: mergeReadMiddle / mergeReadToEnd / mergeWrite)
+MODE_MIDDLE = "READ_MIDDLE"
+MODE_TO_END = "READ_TO_END"
+MODE_WRITE = "WRITE"
+
+action Init:
+    # --- database state ---
+    db_tasks = set([l + 1 for l in range(NUM_TASKS)])   # levels 1..NUM_TASKS
+
+    # --- reader state (fairTaskReader fields) ---
+    outstanding = {}     # outstandingTasks: level -> LOADED | ACKED
+    read_level = 0       # readLevel
+    ack_level = 0        # ackLevel
+    at_end = False       # atEnd
+
+    # --- "network" between reader and DB ---
+    read_req = None      # (readFrom-exclusive, batchSize) or None
+    read_resp = None     # (levels list, hitEnd bool) or None
+
+    # --- ghost variables (assertions only, not real state) ---
+    confirmed = set(db_tasks)   # tasks confirmed durable (M1: the initial set)
+    ever_acked = set()          # tasks that were acked at least once
+
+    # Start(): initial maybeReadTasksLocked. Conditions trivially hold
+    # (not at end, nothing loaded), so the read loop starts.
+    read_state = RS.LOOP
+
+###############################################################################
+# helpers: these correspond to fairTaskReader methods called under tr.lock
+###############################################################################
+
+atomic func loaded_count():
+    # tr.loadedTasks (derived instead of tracked; the code asserts they match)
+    return len([l for l in outstanding if outstanding[l] == LOADED])
+
+atomic func should_read_more():
+    # shouldReadMoreLocked
+    if at_end:
+        return False
+    lc = loaded_count()
+    if lc > RELOAD_AT:
+        return False
+    return True
+
+atomic func maybe_read():
+    # maybeReadTasksLocked (no backoff timer until M4)
+    if read_state != RS.IDLE:
+        return
+    srm = should_read_more()
+    if srm:
+        read_state = RS.LOOP
+
+atomic func advance_ack():
+    # advanceAckLevelLocked (no pinning until M2)
+    for _ in range(NUM_TASKS + 1):
+        if len(outstanding) == 0:
+            break
+        m = min(outstanding.keys())
+        if outstanding[m] != ACKED:
+            break
+        ack_level = m
+        outstanding.pop(m)
+
+atomic func merge_tasks(tasks, mode):
+    # mergeTasksLocked. tasks: list of levels just read (or written, M2+).
+
+    # (1) currently loaded tasks + (2) incoming tasks, filtered:
+    incoming = []
+    for t in tasks:
+        if t <= ack_level:
+            # reads race acks: ignore tasks already at-or-below ack level
+            continue
+        elif mode == MODE_WRITE and not at_end and t > read_level:
+            # not at end: can't accept writes above read level (unknown gap)
+            continue
+        elif t in outstanding:
+            # already have it (loaded or acked)
+            continue
+        incoming.append(t)
+    loaded_levels = [l for l in outstanding if outstanding[l] == LOADED]
+    merged = sorted(loaded_levels + incoming)
+
+    # keep the first BATCH_SIZE in memory
+    keep = merged[:BATCH_SIZE]
+    dropped = merged[BATCH_SIZE:]
+
+    if len(keep) > 0:
+        # readLevel = max level of what we keep in memory
+        read_level = keep[-1]
+    # else: merged is empty, leave read_level unchanged (fix f534e74e)
+
+    evicted_any = False
+    # evict loaded tasks that no longer fit (dropped incoming are just ignored)
+    for t in dropped:
+        evicted_any = True
+        if outstanding.get(t, None) == LOADED:
+            outstanding.pop(t)
+            # the task is still in the DB; it will be re-read later
+
+    # evict acks above the new read level (fix 8ca7b640 #4); they are
+    # forgotten (re-read tasks get re-dispatched) until the M5 cache
+    for t in [l for l in outstanding if outstanding[l] == ACKED and l > read_level]:
+        outstanding.pop(t)
+        evicted_any = True
+
+    # add the kept incoming tasks to memory
+    for t in keep:
+        if t not in outstanding:
+            outstanding[t] = LOADED
+
+    # advance ack level (matters for expired/pre-acked entries, M3+)
+    advance_ack()
+
+    # update atEnd
+    if mode == MODE_MIDDLE or evicted_any:
+        at_end = False
+    elif mode == MODE_TO_END:
+        at_end = True
+
+###############################################################################
+# reader process
+###############################################################################
+
+atomic fair action ReaderReadLoop:
+    # one iteration of the readTasksImpl for-loop (top of loop, under lock)
+    require read_state == RS.LOOP
+    srm = should_read_more()
+    if srm:
+        # readTaskBatch: send GetFairTasks(readLevel+1, batch) to the DB
+        lc = loaded_count()
+        read_req = (read_level, BATCH_SIZE - lc)
+        read_state = RS.REQ
+    else:
+        # exit loop: readPending = false; (newlyWrittenTasks: M2);
+        # then re-check maybeReadTasksLocked (fix 26d9a561)
+        read_state = RS.IDLE
+        maybe_read()
+
+atomic fair action ReaderMergeRead:
+    # response arrived: retrier.Reset(); mergeTasks(res, mode); loop again
+    require read_state == RS.RESP
+    tasks = read_resp[0]
+    hit_end = read_resp[1]
+    read_resp = None
+    read_state = RS.LOOP
+    if hit_end:
+        merge_tasks(tasks, MODE_TO_END)
+    else:
+        merge_tasks(tasks, MODE_MIDDLE)
+
+###############################################################################
+# acker process: eventually acks every loaded task
+###############################################################################
+
+atomic fair action AckTask:
+    # completeTask happy path -> completeTaskLocked
+    loaded = [l for l in outstanding if outstanding[l] == LOADED]
+    require len(loaded) > 0
+    # fair choice: every loaded task is eventually acked (in reality every
+    # dispatched task eventually completes). Plain oneof would let the
+    # "adversary" re-ack only re-read tasks forever and starve one task.
+    t = fair any loaded
+    outstanding[t] = ACKED
+    ever_acked.add(t)
+    advance_ack()
+    maybe_read()
+
+# NOTE: the GC process is deliberately NOT modeled (review decision): GC only
+# issues "delete where level <= ackLevel", which is safe by construction as
+# long as AckLevelOnlyPassesAcked holds — that property IS the "never GC an
+# unacked task" property. Failure/retry of the delete is idempotent and
+# carries no obligations, so modeling it only multiplied the state space.
+
+###############################################################################
+# database process: executes reads
+###############################################################################
+
+atomic fair action DbRead:
+    # DB executes GetFairTasks atomically
+    require read_state == RS.REQ
+    from_level = read_req[0]
+    batch = read_req[1]
+    res = sorted([t for t in db_tasks if t > from_level])[:batch]
+    read_req = None
+    read_resp = (res, len(res) < batch)
+    read_state = RS.RESP
+
+###############################################################################
+# properties
+###############################################################################
+
+always assertion MemoryInWindow:
+    # in-memory tasks (and pending acks) are exactly within (ackLevel, readLevel]
+    if ack_level > read_level:
+        return False
+    for l in outstanding:
+        if l <= ack_level or l > read_level:
+            return False
+    return True
+
+always assertion AckLevelOnlyPassesAcked:
+    # (This also covers "never GC an unacked task": GC only deletes rows at
+    # or below a previously observed ackLevel, and ackLevel is monotonic.)
+    # if the ack level moved past a confirmed task, it must have been acked
+    for t in confirmed:
+        if t <= ack_level and t not in ever_acked:
+            return False
+    return True
+
+transition assertion AckLevelMonotonic(before, after):
+    return after.ack_level >= before.ack_level
+
+# main liveness property: every confirmed task is eventually acked, and the
+# ack level eventually passes every task (reader never gets stuck)
+eventually always assertion AllConfirmedTasksAcked:
+    remaining = len([t for t in confirmed if t not in ever_acked])
+    behind = len([t for t in confirmed if t > ack_level])
+    return remaining == 0 and behind == 0
+
+# sanity: interesting states are actually reachable
+exists assertion BufferFills:
+    return len([l for l in outstanding if outstanding[l] == LOADED]) == BATCH_SIZE
+
+exists assertion ReachesEnd:
+    return at_end

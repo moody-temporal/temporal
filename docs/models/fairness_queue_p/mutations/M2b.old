@@ -1,0 +1,5 @@
+      if (outstanding[ks[i]] && ks[i] > readLevel) {
+        outstanding -= (ks[i]);
+        evictedAcks += (ks[i]);
+        evictedAny = true;
+      }

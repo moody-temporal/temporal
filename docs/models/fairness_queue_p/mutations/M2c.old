@@ -1,0 +1,4 @@
+    if (kept > 0) {
+      // if we have any tasks at all in memory, readLevel is the max of that set
+      readLevel = merged[kept - 1];
+    }

@@ -1,0 +1,8 @@
+      if (!(lvl in isNew)) {
+        outstanding -= (lvl);
+        loaded = loaded - 1;
+        // setEvicted: direct (under the reader lock), so it can beat the
+        // matcher add for the same instance, which goes through the hop
+        send acker, eTaskEvicted, (lvl = lvl, id = deliveryId[lvl]);
+        evictedAcks += (lvl); // M6a: cache evicted unacked tasks as if acked
+      }

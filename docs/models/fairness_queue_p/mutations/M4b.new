@@ -1,0 +1,4 @@
+      if (hadErr) {
+        atEnd = false;
+        // M4b: don't initiate a read here
+      }

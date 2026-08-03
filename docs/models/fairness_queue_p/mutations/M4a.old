@@ -1,0 +1,4 @@
+      // re-check before finishing, in case the backoff timer already fired
+      // while readPending was still true (the 26d9a561 fix)
+      maybeRead();
+    }
