@@ -86,3 +86,44 @@ Each `Mut*` constant re-introduces one bug (historical bugs are tagged with
 their fixing commit; "seeded" ones are synthetic). `run.sh` checks that TLC
 finds the expected violation for each — a milestone isn't trusted until its
 target bugs are demonstrably caught. All flags FALSE = current code.
+
+## Btree-merge variant (`BtreeMerge`)
+
+The model above was written against the pre-btree `mergeTasksLocked`. The
+matching team then rewrote it to keep `outstandingTasks` in a copy-on-write
+`tidwall/btree` and simplified the merge (see
+`service/matching/fair_task_reader.go` and `HANDOFF.md`). The `BtreeMerge`
+constant selects which merge the model uses:
+
+- `BtreeMerge = FALSE` — the original pre-btree merge (`MergeResultOld`).
+  This is what every `FairQueue*.cfg` above uses, so the old model and its
+  mutation suite are unchanged.
+- `BtreeMerge = TRUE` — the current merge (`MergeResultBtree`): a single cut
+  over loaded∪acks at the `(BatchTarget+1)`-th *loaded* entry, acks below the
+  cut retained in the tree, `readLevel` = max of *all* kept entries (loaded or
+  ack), and `atEnd` driven by whether a loaded task was dropped (`haveCut`)
+  rather than by "any entry evicted". Only the pure merge operator differs;
+  all processes and properties are shared.
+
+The two live findings in `findings.md` are artifacts of the old merge's
+`readLevel` collapse + ack eviction, which the btree merge removes. The btree
+cfgs demonstrate the fix:
+
+- `FairQueue_btree.cfg` — full safety + liveness at MaxLevel=3, **with
+  `NoStuck` promoted to an invariant**. Passes: the "fair reader stuck" state
+  (findings #3) is unreachable under the btree merge, so the defensive
+  detector's repair is no longer load-bearing. (Contrast: on the old merge,
+  adding `NoStuck` to `FairQueue.cfg` is violated in seconds.)
+- `FairQueue_btree_churn.cfg` — the findings-#1 churn setup (a task that never
+  acks). `ReaderQuiesce` **holds**, where `FairQueue_churn.cfg` (old merge)
+  violates it: the btree reader quiesces instead of busy re-reading.
+- `FairQueue_btree_safety4.cfg` — safety-only at MaxLevel=4, same as
+  `FairQueue_safety4.cfg` for the current merge.
+
+Run them the same way, e.g.:
+
+```sh
+java -cp ../tla2tools.jar pcal.trans -nocfg FairQueue.tla
+java -XX:+UseParallelGC -cp ../tla2tools.jar tlc2.TLC -workers auto \
+     -config FairQueue_btree.cfg FairQueue.tla
+```

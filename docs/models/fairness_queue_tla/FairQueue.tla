@@ -72,6 +72,13 @@ CONSTANTS
   AckableLevels,   \* levels the acker may ack (all of Levels normally; a
                    \* subset models tasks with no available poller, for the
                    \* finding-1 churn regression)
+  BtreeMerge,      \* FALSE: the pre-btree mergeTasksLocked (readLevel = max of
+                   \* the loaded window only; acks above it are evicted). TRUE:
+                   \* the current CoW-btree merge -- readLevel = max of all kept
+                   \* entries (loaded OR ack), a single cut over loaded#acks at
+                   \* the (BatchTarget+1)-th loaded entry, acks below the cut
+                   \* retained. See ../../../service/matching/fair_task_reader.go
+                   \* mergeTasksLocked and HANDOFF.md sec 5-6.
   \* --- mutation flags ---
   MutAtEndOnMiddleRead,  \* seeded: treat every read as reaching the end
   MutAckPastLoaded,      \* seeded: ack level advance ignores loaded tasks
@@ -100,6 +107,7 @@ MToEnd  == "readToEnd"
 MWrite  == "write"
 
 SetMax(S) == CHOOSE x \in S : \A y \in S : y <= x
+SetMin(S) == CHOOSE x \in S : \A y \in S : x <= y
 \* The n lowest elements of S (all of S if it has <= n elements).
 KeepLowest(S, n) == {l \in S : Cardinality({m \in S : m <= l}) <= n}
 
@@ -114,8 +122,13 @@ PinActive(p) == p /\ ~MutNoPin
 (* Returns a record; .stuck is the condition of the defensive "fair        *)
 (* reader stuck" check (the call site must additionally rule out a         *)
 (* pending read / backoff timer).                                          *)
+(*                                                                         *)
+(* Two variants, selected by the BtreeMerge constant: MergeResultOld is    *)
+(* the pre-btree implementation; MergeResultBtree is the current CoW-btree *)
+(* rewrite. MergeResult dispatches. The call sites and every other process *)
+(* are identical for both -- only the pure merge changed.                  *)
 (***************************************************************************)
-MergeResult(loaded0, acks0, rl0, al0, atEnd0, inc, mode, pinnedNow, expSel,
+MergeResultOld(loaded0, acks0, rl0, al0, atEnd0, inc, mode, pinnedNow, expSel,
             cache0) ==
   LET
     \* filter incoming: skip at-or-below ackLevel (raced with acks); on
@@ -183,6 +196,88 @@ MergeResult(loaded0, acks0, rl0, al0, atEnd0, inc, mode, pinnedNow, expSel,
     consumed |-> IF MutDropExpiredEarly THEN eligible \cap expSel
                  ELSE keptNewExpired
   ]
+
+(***************************************************************************)
+(* MergeResultBtree: the current CoW-btree mergeTasksLocked.               *)
+(*                                                                         *)
+(* Differences from MergeResultOld (see fair_task_reader.go steps 1-5 and  *)
+(* HANDOFF.md sec 6):                                                      *)
+(*  - Cache-hit / expired / new classification happens at INSERTION, over  *)
+(*    all eligible incoming (pre-cut), matching the Go loop in step (1).   *)
+(*  - A single cut partitions loaded#acks at the (BatchTarget+1)-th LOADED  *)
+(*    entry (acks don't occupy a slot): keep everything below the cut,     *)
+(*    drop everything at/above it. keptLoaded is the BatchTarget lowest    *)
+(*    loaded levels; acks below the cut are RETAINED, acks at/above it are *)
+(*    evicted to the cache.                                                *)
+(*  - readLevel is the max of ALL kept entries (loaded OR ack), so it no    *)
+(*    longer collapses toward the ack level when the tail is acks.         *)
+(*  - atEnd is driven by haveCut (did we drop a loaded task), not by "any  *)
+(*    entry evicted" -- retained acks below the cut no longer force        *)
+(*    atEnd=FALSE. This is what fixes findings #1 and #3.                  *)
+(***************************************************************************)
+MergeResultBtree(loaded0, acks0, rl0, al0, atEnd0, inc, mode, pinnedNow,
+                 expSel, cache0) ==
+  LET
+    \* (1) filter incoming, same rules as the old merge
+    eligible == {l \in inc :
+                   /\ l > al0
+                   /\ ~(mode = MWrite /\ ~atEnd0 /\ l > rl0)
+                   /\ l \notin (loaded0 \cup acks0)}
+    \* classify at insertion (pre-cut): cache hit (evictedAcks.Delete) wins
+    \* over expiry, expiry over new -- the if/else-if order in step (1).
+    cacheHits  == eligible \cap cache0
+    expiredNew == (eligible \ cache0) \cap expSel
+    createdNew == (eligible \ cache0) \ expSel
+    loadedAll  == loaded0 \cup createdNew
+    acksAll    == acks0 \cup cacheHits \cup expiredNew
+    \* (2) the cut: keep the BatchTarget lowest LOADED entries; the cut
+    \* level is the smallest dropped loaded level. Acks don't count.
+    keptLoaded == KeepLowest(loadedAll, BatchTarget)
+    haveCut    == Cardinality(loadedAll) > BatchTarget
+    cutLevel   == IF haveCut THEN SetMin(loadedAll \ keptLoaded) ELSE 0
+    \* (3)/(4) everything strictly below the cut is kept; at/above is chopped
+    keptAcks      == IF haveCut THEN {l \in acksAll : l < cutLevel} ELSE acksAll
+    evictedAckSet == acksAll \ keptAcks
+    droppedLoaded == loadedAll \ keptLoaded
+    newLoaded == keptLoaded
+    newAcks   == keptAcks
+    keptAll   == keptLoaded \cup keptAcks
+    \* (5) readLevel = max over all kept (loaded OR ack); empty => unchanged
+    newRL == IF keptAll /= {} THEN SetMax(keptAll) ELSE rl0
+    \* evicted-ack cache: drop consumed hits, add acks chopped above the cut
+    \* (MutCachePoison also feeds dropped loaded tasks in -- the bug), PopMax
+    \* trims to size.
+    cacheAdd == evictedAckSet
+                \cup (IF MutCachePoison THEN droppedLoaded ELSE {})
+    cacheTrimmed == KeepLowest((cache0 \ cacheHits) \cup cacheAdd, EvictedCacheMax)
+    \* advanceAckLevelLocked: pop acks below the lowest loaded, unless pinned
+    clear == IF PinActive(pinnedNow) THEN {}
+             ELSE {c \in newAcks : MutAckPastLoaded \/ \A m \in newLoaded : c < m}
+    newAtEnd == IF MutAtEndOnMiddleRead /\ mode \in {MMiddle, MToEnd} THEN TRUE
+                ELSE IF (mode = MMiddle) \/ haveCut THEN FALSE
+                ELSE IF mode = MToEnd THEN TRUE
+                ELSE atEnd0
+  IN [
+    loaded  |-> newLoaded,
+    acks    |-> newAcks \ clear,
+    rl      |-> newRL,
+    al      |-> IF clear = {} THEN al0 ELSE SetMax(clear),
+    atEnd   |-> newAtEnd,
+    stuck   |-> mode = MWrite /\ ~newAtEnd /\ newLoaded = {},
+    cache   |-> cacheTrimmed,
+    \* expired incoming leave the committed set whether kept or chopped
+    \* (a chopped expired ack re-materialises as an ack on re-read, never
+    \* delivered), matching recordDroppedTask at insertion time.
+    consumed |-> expiredNew
+  ]
+
+MergeResult(loaded0, acks0, rl0, al0, atEnd0, inc, mode, pinnedNow, expSel,
+            cache0) ==
+  IF BtreeMerge
+  THEN MergeResultBtree(loaded0, acks0, rl0, al0, atEnd0, inc, mode, pinnedNow,
+                        expSel, cache0)
+  ELSE MergeResultOld(loaded0, acks0, rl0, al0, atEnd0, inc, mode, pinnedNow,
+                      expSel, cache0)
 
 (* --algorithm FairQueue
 

@@ -4,6 +4,16 @@ Candidate issues in the real code surfaced while building the model. Each
 needs verification (e.g. a targeted Go unit test) before being treated as a
 real bug.
 
+> **Update (btree rewrite):** findings #1 and #3 are both artifacts of the
+> pre-btree merge lowering `readLevel` to `max(loaded)` on an empty/all-expired
+> merge and then evicting the ack above it. The copy-on-write btree rewrite of
+> `mergeTasksLocked` keeps `readLevel` at the max of *all* kept entries (loaded
+> or ack) and retains acks below the cut, so neither the churn nor the stuck
+> state occurs. This is **model-confirmed** with `BtreeMerge = TRUE`:
+> `FairQueue_btree_churn.cfg` holds `ReaderQuiesce` (finding #1), and
+> `FairQueue_btree.cfg` holds `NoStuck` as an invariant at MaxLevel=3 (finding
+> #3) — both fail on the old merge. See README "Btree-merge variant".
+
 ## 1. Busy re-read loop when lowest loaded task is slow to ack (candidate)
 
 Status: **model-confirmed against current code** (with the evicted-ack
