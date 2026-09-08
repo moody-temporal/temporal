@@ -676,6 +676,20 @@ func latestLogicalBacklogCount(snap map[string][]*metricstest.CapturedRecording,
 	return latest, found
 }
 
+// latestLogicalBacklogAge returns the most recent approximate_backlog_age_seconds
+// recording for the given worker_version and task_priority tag values.
+func latestLogicalBacklogAge(snap map[string][]*metricstest.CapturedRecording, workerVersion, priorityTag string) (float64, bool) {
+	var latest float64
+	found := false
+	for _, rec := range snap[metrics.ApproximateBacklogAgeSeconds.Name()] {
+		if rec.Tags["worker_version"] == workerVersion && rec.Tags[metrics.TaskPriorityTagName] == priorityTag {
+			latest = rec.Value.(float64)
+			found = true
+		}
+	}
+	return latest, found
+}
+
 // addRoutingConfigUserData sets up deployment user data with a current version and an optional
 // ramping version. Pass "" for rampingBuildID to omit ramping. Note, this only adds the routing config
 // for the Workflow Task Queue Type.
@@ -748,6 +762,26 @@ func (s *PartitionManagerTestSuite) TestLogicalBacklogMetrics_NoVersioning() {
 		snap := capture.Snapshot()
 		count, ok := latestLogicalBacklogCount(snap, "__unversioned__", defaultPriorityTag)
 		return ok && count == float64(5)
+	}, 2*time.Second, 50*time.Millisecond)
+}
+
+func (s *PartitionManagerTestSuite) TestLogicalBacklogMetrics_AgeTaggedByPriority() {
+	pm, capture, cleanup := s.setupPartitionManagerWithCapture(testPartitionManagerConfig{
+		loadTime: 1 * time.Minute,
+	})
+	defer cleanup()
+
+	s.spoolDefaultTasks(pm, 5)
+
+	// The age gauge is emitted per priority, so the lookup requires the priority tag to match.
+	await.RequireTrue(s.T(), func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		pm.fetchAndEmitLogicalBacklogMetrics(ctx)
+
+		snap := capture.Snapshot()
+		_, ageOk := latestLogicalBacklogAge(snap, "__unversioned__", defaultPriorityTag)
+		return ageOk
 	}, 2*time.Second, 50*time.Millisecond)
 }
 

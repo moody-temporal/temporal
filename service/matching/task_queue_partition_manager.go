@@ -1630,20 +1630,18 @@ func (pm *taskQueuePartitionManagerImpl) fetchAndEmitLogicalBacklogMetrics(ctx c
 			metrics.WorkerDeploymentBuildIDTag(buildID, pm.config.BreakdownMetricsByBuildID()),
 		)
 
-		// Per-priority backlog count
+		// Per-priority backlog count and age
 		for pri, stats := range pqInfo.GetTaskQueueStatsByPriorityKey() {
+			priorityTag := metrics.MatchingTaskPriorityTag(pri)
 			metrics.ApproximateBacklogCount.With(versionHandler).Record(
 				float64(stats.GetApproximateBacklogCount()),
-				metrics.MatchingTaskPriorityTag(pri),
+				priorityTag,
 			)
-		}
 
-		// Backlog age (oldest across all priorities)
-		age := pqInfo.GetTaskQueueStats().GetApproximateBacklogAge()
-		if age != nil && age.AsDuration() > 0 {
-			metrics.ApproximateBacklogAgeSeconds.With(versionHandler).Record(age.AsDuration().Seconds())
-		} else {
-			metrics.ApproximateBacklogAgeSeconds.With(versionHandler).Record(0)
+			metrics.ApproximateBacklogAgeSeconds.With(versionHandler).Record(
+				stats.GetApproximateBacklogAge().AsDuration().Seconds(),
+				priorityTag,
+			)
 		}
 	}
 }
@@ -1670,9 +1668,10 @@ func (pm *taskQueuePartitionManagerImpl) emitZeroLogicalBacklogForQueue(version 
 		metrics.WorkerDeploymentBuildIDTag(buildID, pm.config.BreakdownMetricsByBuildID()),
 	)
 	for pri := range pq.GetStatsByPriority(false) {
-		metrics.ApproximateBacklogCount.With(handler).Record(0, metrics.MatchingTaskPriorityTag(pri))
+		priorityTag := metrics.MatchingTaskPriorityTag(pri)
+		metrics.ApproximateBacklogCount.With(handler).Record(0, priorityTag)
+		metrics.ApproximateBacklogAgeSeconds.With(handler).Record(0, priorityTag)
 	}
-	metrics.ApproximateBacklogAgeSeconds.With(handler).Record(0)
 }
 
 // parseDeploymentFromVersionKey extracts the deployment name and build ID from a version key
